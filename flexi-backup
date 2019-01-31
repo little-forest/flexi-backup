@@ -5,11 +5,6 @@
 # Copyright: Original code by Yusuke Komori.
 #                       Copyright (c) 2018. Yusuke Komori, All rights reserved.
 #===============================================================================
-# TODO
-#  INCLUDeオプションがいい加減になっている
-#  /var/lib/docker/volumes配下の特定ディレクトリだけアーカイブできるようにする
-#  アーカイブのプレフィックスを自由に決められるようにする
-#===============================================================================
 
 SCRIPT_BASE=`echo $(cd $(dirname $0); pwd)`
 SCRIPT_NAME=`basename $0`
@@ -227,22 +222,6 @@ ${C_WHITE}usage${C_OFF} : $SCRIPT_NAME [OPTIONS] [-c CONF_FILE_PATH] [-D] BACKUP
     IDENTITY_FILE(option)
       リモートバックアップ接続時の秘密鍵ファイル
 EOM
-#  echo "usege : $SCRIPT_NAME ${LONG_OPTIONS} [-d] [-s] [-m (tar|gz|bz2)] [-p USE_PROCESSORS] [-f BACKUP_LIST]"
-#  echo "          -d : Dry run (don't backup)"
-#  echo "          -s : Show each backup target file size. (don't backup)"
-#  echo "          -m : Backup method tar/gz/bz2"
-#  echo "          -p : Number of processors for pbzip2 (default: half of processors)"
-#  echo "          -f : backup list File (default: ${BACKUP_LIST})"
-#  echo ""
-#  echo "backup.conf :"
-#  echo "  BACKUP_MNT    : backup mount point"
-#  echo "  BACKUP_BASE   : backup base directory"
-#  echo "  GENERATION    : backup generation"
-#  echo "  SFTP_TRANSFER : transfer to remote host via sftp after archiving"
-#  echo "  REMOTE_BASE   : remote base directory"
-#  echo "  REMOTE_HOST   : remote host"
-#  echo "  REMOTE_PORT   : remote port"
-#  echo "  REMOTE_USER   : remote user"
   exit 1
 }
 #}}}
