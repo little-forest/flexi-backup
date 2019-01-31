@@ -1,0 +1,11 @@
+BACKUP_BASE=/backup
+GENERATION=5
+
+REMOTE_PROTO=sftp
+REMOTE_HOST=backup.example.com
+REMOTE_PORT=22
+REMOTE_USER=backup
+IDENTITY_FILE=~/.ssh/id_rsa
+
+TMP_DIR=/tmp
+

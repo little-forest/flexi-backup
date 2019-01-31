@@ -1,0 +1,10 @@
+bz2:/home/foo --exclude .recycle.foo .cache .gem
+
+bz2:/opt/bar --exclude */.git
+
+gz:/var/www/ --exclude-size +50M
+
+tar:/var/git/*
+
+tar:/var/git/.
+

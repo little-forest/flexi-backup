@@ -1,0 +1,879 @@
+#!/bin/bash
+#===============================================================================
+# flex-backup :
+# Date    :  2018/07/08 Start
+# Copyright: Original code by Yusuke Komori.
+#                       Copyright (c) 2018. Yusuke Komori, All rights reserved.
+#===============================================================================
+# TODO
+#  INCLUDeオプションがいい加減になっている
+#  /var/lib/docker/volumes配下の特定ディレクトリだけアーカイブできるようにする
+#  アーカイブのプレフィックスを自由に決められるようにする
+#===============================================================================
+
+SCRIPT_BASE=`echo $(cd $(dirname $0); pwd)`
+SCRIPT_NAME=`basename $0`
+
+#-------------------------------------------------------------------------------
+#- global variables ------------------------------------------------------------
+_TMPFILE_NAMES=`mktemp --version 2> /dev/null | grep -q 'GNU coreutils' && [[ -d /dev/shm ]] && mktemp -p /dev/shm || mktemp`
+_TARGET_DIR=
+_TAR_DEFAULT_OPTS=()
+_TAR_ADDITIONAL_OPTS=()
+_LOCAL_GENERATION=
+readonly _BSD_TAR_DEFAULT_OPTS=()
+readonly _GNU_TAR_DEFAULT_OPTS=(--acls --selinux)
+readonly _CONF_FILE_NAME=flexi-backup.conf
+readonly _LONG_OPT_NAMES=(--silent --no-color --verbose --estimate --rotate --with-rotate --dry-run --help)
+
+readonly _SFTPCP=$(dirname "`readlink -f $0`")/sftpcp
+
+# from configuration
+_BACKUP_BASE=
+_BACKUP_TMP_DIR=
+_GENERATION=
+_ARCHIVE_SUFFIX='+_%Y%m%d-%H%M%S'
+_ROTATE_TARGET_PATTERN='.+_[0-9]+-[0-9]+\.tar(.[a-zA-Z0-9]+)?'
+
+_REMOTE_PROTO=
+_REMOTE_HOST=
+_REMOTE_USER=
+_REMOTE_PORT=22
+_IDENTITY_FILE=
+
+#-------------------------------------------------------------------------------
+#- setup -----------------------------------------------------------------------
+_setup() { #{{{
+  tty -s || _SILENT=yes
+
+  if sed --version 2>/dev/null | grep -q 'GNU sed'; then
+    # GNU sed
+    readonly SED='sed -re'
+    # escape sequence remover
+    # http://ascii-table.com/ansi-escape-sequences-vt-100.php
+    readonly _RMESC=(sed -r "s:\x1B[\(\)][AB012]::g;s:\x1B\[([0-9]{1,2}(;[0-9]{1,2})*)?m::g")
+  else
+    # BSD sed
+    readonly SED='sed -Ee'
+    readonly _RMESC=(sed -e '')
+  fi
+
+  find --version 2>/dev/null | grep -q 'GNU findutils' && _FIND='find' || _FIND='find -E'
+  readonly _FIND
+
+  tar --version 2> /dev/null | grep -q 'bsdtar' && local _BSD_TAR=yes
+
+  [[ $_BSD_TAR == 'yes' ]] \
+    && _TAR_DEFAULT_OPTS=(${_BSD_TAR_DEFAULT_OPTS[@]}) \
+    || _TAR_DEFAULT_OPTS=(${_GNU_TAR_DEFAULT_OPTS[@]})
+}
+#}}}
+
+_setup_out() { #{{{
+  # TODO: mac対応
+
+  readonly SED_OPT=(-re "s:\x1B[\(\)][AB012]::g;s:\x1B\[([0-9]{1,2}(;[0-9]{1,2})*)?m::g")
+  readonly LOGGER_OPT=(-i -t "$SCRIPT_NAME")
+  readonly LOGGER_OPT_E=(-i -t "$SCRIPT_NAME" -p user.err)
+
+  # fd3 is raw stdout
+  exec 3>&1
+  # fd4 is raw stderr
+  exec 4>&2
+
+  # stdout(fd1) will be logged
+  if [[ ! $_SILENT ]]; then
+    exec 1> >(tee >(sed ${SED_OPT[@]} | logger ${LOGGER_OPT[@]}))
+  else
+    # in silent mode, all stdout will be logged
+    exec 1> >(sed ${SED_OPT[@]} | logger ${LOGGER_OPT[@]})
+  fi
+
+  # stderr(fd2) will be prefixed and logged
+  exec 2> >(tee >(sed ${SED_OPT[@]} | sed -re 's/^/[ERROR] /' | logger ${LOGGER_OPT_E[@]}) \
+    | sed -e "s|^|[${C_UL}${C_RED}ERROR${C_OFF}] |" >&4)
+
+  # fd5 is debug out
+  # debug usage:: echo 'debug message' > &5
+  [[ $_VERBOSE ]] && exec 5> >(sed -e "s/^/[${C_WHITE}DEBUG${C_OFF}] /" >&3) || exec 5> /dev/null
+}
+#}}}
+
+#-------------------------------------------------------------------------------
+#- common functions ------------------------------------------------------------
+
+__setup_color() { #{{{
+  readonly C_OFF=`tput sgr0`   # Reset attribute
+  readonly C_BOLD=`tput bold`
+  readonly C_REV=`tput rev`    # Reverse mode
+  readonly C_UL=`tput smul`    # Underline mode
+
+  # Background
+  readonly C_B_BLACK=`tput setab 0`
+  readonly C_B_RED=`tput setab 1`
+  readonly C_B_GREEN=`tput setab 2`
+  readonly C_B_YELLOW=`tput setab 3`
+  readonly C_B_BLUE=`tput setab 4`
+  readonly C_B_MAGENTA=`tput setab 5`
+  readonly C_B_CYAN=`tput setab 6`
+  readonly C_B_WHITE=`tput setab 7`
+
+  # Foreground
+  readonly C_BLACK=`tput setaf 0`
+  readonly C_RED=`tput setaf 1`
+  readonly C_GREEN=`tput setaf 2`
+  readonly C_YELLOW=`tput setaf 3`
+  readonly C_BLUE=`tput setaf 4`
+  readonly C_MAGENTA=`tput setaf 5`
+  readonly C_CYAN=`tput setaf 6`
+  readonly C_WHITE="${C_BOLD}`tput setaf 7`"
+
+  readonly __COLORED=yes
+}
+#}}}
+
+__move_col() { #{{{
+  tput hpa "$1"
+}
+#}}}
+
+__show_ok() { #{{{
+  [ "${_SILENT}" ] && return
+  [[ "$1" && "$1" -gt 0 ]] && echo -en "\\033[${1}G"
+  echo -en "[ ${C_GREEN}OK${C_OFF}"
+  [ "$2" ] && echo " ]$2" || echo " ]"
+}
+#}}}
+
+__show_info() { #{{{
+  [[ -n "${_SILENT}" ]] && return
+  [[ "$1" == "-n" ]] && echo -en "${C_CYAN}${2}${C_OFF}" || echo -e "${C_CYAN}${1}${C_OFF}"
+}
+#}}}
+
+__error_end() { #{{{
+  echo "$@" >&2; exit 1
+}
+#}}}
+
+__make_tempfile() { #{{{
+  local TMPFILE=`mktemp --version 2> /dev/null | grep -q 'GNU coreutils' && [[ -d /dev/shm ]] && mktemp -p /dev/shm || mktemp`
+  echo "$TMPFILE" >> $_TMPFILE_NAMES
+  echo "$TMPFILE"
+}
+#}}}
+
+__clear_temps() { #{{{
+  local _TMPFILE_NAMES=$1
+  [[ ! -f "$_TMPFILE_NAMES" ]] && return
+  local LINE
+  while read LINE; do
+    [[ -f "$T" ]] && rm -f "$T"
+    [[ -d "$T" ]] && rm -rf "$T"
+  done < $_TMPFILE_NAMES
+  rm $_TMPFILE_NAMES
+
+  echo "${C_CYAN}process end.${C_OFF}"
+}
+trap "__clear_temps $_TMPFILE_NAMES" EXIT
+#}}}
+
+#-------------------------------------------------------------------------------
+#- functions -------------------------------------------------------------------
+
+_usage() { #{{{
+  [[ "$1" ]] && echo "$1" >&2
+  local LONG_OPTIONS=`$SED 's/([a-zA-Z0-9-]+)/[\1]/g' <<<"${_LONG_OPT_NAMES[@]}"`
+
+  cat <<EOM
+${C_WHITE}usage${C_OFF} : $SCRIPT_NAME [OPTIONS] [-c CONF_FILE_PATH] [-D] BACKUP_LIST...
+    --silent      : 標準出力を行いません. syslog出力は行います.ttyがない場合は自動的にsilentオプションが指定されます.
+    --no-color    :
+    --verbose     :
+    --estimate    :
+    --rotate      : Rotate backuped files. Don't backup.
+    --with-rotate : Do backup and rotate.
+    -D --dry-run  : Dry run
+    --help        : Display this usage.
+
+    -c CONF_FILE_PATH
+      コンフィグレーションファイルのパスを指定します.
+
+  ${C_WHITE}flexi-backup.conf${C_OFF} :
+    BACKUP_BASE (mandatory)
+      バックアップ先の基準ディレクトリを指定します.
+
+    TMP_DIR (option)
+      指定すると、このディレクトリにアーカイブを作成した後に BACKUP_BASE 配下へ移動します.
+      BACKUP_BASE がネットワーク経由でマウントされている場合などにパフォーマンスを向上するために
+      指定します.
+    
+    GENERATION (option)
+      バックアップ世代数
+
+    REMOTE_PROTO(option)
+      リモートホストにバックアップする際のプロトコル.
+      sftp のみ有効.
+      
+    REMOTE_HOST(option)
+      リモートバックアップ先のホスト
+
+    REMOTE_PORT(option)
+      リモートバックアップ先のポート番号
+
+    REMOTE_USER(option)
+      リモートバックアップ先接続ユーザ名
+
+    IDENTITY_FILE(option)
+      リモートバックアップ接続時の秘密鍵ファイル
+EOM
+#  echo "usege : $SCRIPT_NAME ${LONG_OPTIONS} [-d] [-s] [-m (tar|gz|bz2)] [-p USE_PROCESSORS] [-f BACKUP_LIST]"
+#  echo "          -d : Dry run (don't backup)"
+#  echo "          -s : Show each backup target file size. (don't backup)"
+#  echo "          -m : Backup method tar/gz/bz2"
+#  echo "          -p : Number of processors for pbzip2 (default: half of processors)"
+#  echo "          -f : backup list File (default: ${BACKUP_LIST})"
+#  echo ""
+#  echo "backup.conf :"
+#  echo "  BACKUP_MNT    : backup mount point"
+#  echo "  BACKUP_BASE   : backup base directory"
+#  echo "  GENERATION    : backup generation"
+#  echo "  SFTP_TRANSFER : transfer to remote host via sftp after archiving"
+#  echo "  REMOTE_BASE   : remote base directory"
+#  echo "  REMOTE_HOST   : remote host"
+#  echo "  REMOTE_PORT   : remote port"
+#  echo "  REMOTE_USER   : remote user"
+  exit 1
+}
+#}}}
+
+_load_conf() { #{{{
+  local CONF_PATH
+  if [[ "$_CONF_FILE_PATH" ]]; then
+    CONF_PATH="$_CONF_FILE_PATH"
+  else
+    [[ -f ~/$_CONF_FILE_NAME ]] && CONF_PATH=~/$_CONF_FILE_NAME
+    [[ ! "$CONF_PATH" ]] && [[ -f /etc/flexi-backup/$_CONF_FILE_NAME ]] && CONF_PATH=/etc/flexi-backup/$_CONF_FILE_NAME
+    [[ ! "$CONF_PATH" ]] && [[ -f /etc/$_CONF_FILE_NAME ]] && CONF_PATH=/etc/$_CONF_FILE_NAME
+    [[ ! "$CONF_PATH" ]] && [[ -f "$SCRIPT_BASE/$_CONF_FILE_NAME" ]] && CONF_PATH=$SCRIPT_BASE/$_CONF_FILE_NAME
+  fi
+
+  [[ ! "$CONF_PATH" ]] && __error_end "Configuration file not found."
+  source "$CONF_PATH"
+
+  echo "Configuration file loaded. : $CONF_PATH" >&5
+
+  # Remote backup parameters
+  if [[ -v REMOTE_PROTO ]]; then
+    readonly _REMOTE_PROTO="${REMOTE_PROTO}"
+  fi
+  if [[ -v REMOTE_HOST ]]; then
+    readonly _REMOTE_HOST="${REMOTE_HOST}"
+  fi
+  if [[ -v REMOTE_PORT ]]; then
+    readonly _REMOTE_PORT="${REMOTE_PORT}"
+  fi
+  if [[ -v REMOTE_USER ]]; then
+    readonly _REMOTE_USER="${REMOTE_USER}"
+  fi
+  if [[ -v IDENTITY_FILE ]]; then
+    readonly _IDENTITY_FILE="${IDENTITY_FILE}"
+  fi
+  echo "Remote : ${_REMOTE_PROTO}://${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT}" >&5
+
+  # verify backup temporary directory
+  if [[ -v TMP_DIR ]]; then
+    _BACKUP_TMP_DIR=`$SED 's|$|/|;s|/+$||' <<<"$TMP_DIR"`
+    _check_dir_writable "$_BACKUP_TMP_DIR" || __error_end "Unable to write directory. : $_BACKUP_TMP_DIR"
+    echo "TMP_DIR verified. : $_BACKUP_TMP_DIR" >&5
+    readonly _BACKUP_TMP_DIR
+  else
+    [[ -z ${REMOTE_PROTO} ]] || __error_end "When REMOTE_PROTO is specified, TMP_DIR is required."
+  fi
+
+  # verify BACKUP_BASE
+  [[ -v BACKUP_BASE ]] \
+    && _BACKUP_BASE=`$SED 's|$|/|;s|/+$|/|' <<<"$BACKUP_BASE"` \
+    || __error_end "BACKUP_BASE is not specified."
+
+  if [[ ! "${_REMOTE_PROTO}" ]]; then
+    [[ ! -d "$_BACKUP_BASE" ]] && __error_end "BACKUP_BASE is not found. : $_BACKUP_BASE"
+    _check_dir_writable "$_BACKUP_BASE" || __error_end "Unable to write directory. : $_BACKUP_BASE"
+    echo "BACKUP_BASE verified. : $_BACKUP_BASE" >&5
+  else
+    echo "BACKUP_BASE verification was skipped. : $_BACKUP_BASE" >&5
+  fi
+  readonly _BACKUP_BASE
+
+  # verify rotate generation
+  if [[ "$GENERATION" ]]; then
+    [[ "$GENERATION" =~ [0-9]+ ]] || __error_end "Illegal generation. : $GENERATION"
+    [[ "$GENERATION" -ge 0 ]] || __error_end "Illegal generation. : $GENERATION"
+    _GENERATION=`expr $GENERATION + 0`
+  fi
+  echo "Backup generation : $_GENERATION" >&5
+  readonly _GENERATION
+
+}
+#}}}
+
+_check_dir_writable() { #{{{
+  local TARGET_DIR="$1"
+
+  local TMPFILE="${TARGET_DIR}/`basename $(mktemp -u)`"
+  mkdir $TMPFILE 2> /dev/null
+  [[ ! -d "$TMPFILE" ]] && return 1
+  rmdir "$TMPFILE"
+  return 0
+}
+#}}}
+
+_read_backuplist() { #{{{
+  local LIST_FILE="$1"
+  local TARGET_DIR
+  local OPTS
+  [[ ! -f "$LIST_FILE" ]] && __error_end "Backup list file is not found. : $LIST_FILE"
+  while read TARGET_DIR OPTS; do
+    if [[ "$TARGET_DIR" =~ .+/\*$ ]]; then
+      # expand subdirectories
+      local ARC_TYPE=`$SED 's|([^:]+:).+|\1|' <<<"$TARGET_DIR"`
+      local TARGET_BASE_DIR=`$SED 's|^[a-zA-Z0-9]+:/|/|;s|/\*$||' <<<"$TARGET_DIR"`
+      [[ ! -d "$TARGET_BASE_DIR" ]] && __error_end "Directory not found. : $TARGET_BASE_DIR"
+      find "$TARGET_BASE_DIR" -mindepth 1 -maxdepth 1 -type d | xargs -I{} echo "${ARC_TYPE}{} $OPTS"
+      echo "${ARC_TYPE}${TARGET_BASE_DIR}/. $OPTS"
+    else
+      echo "$TARGET_DIR $OPTS"
+    fi
+  done < <($SED '/^[ \t]*#.*/d;/^[ \t]*$/d' "$LIST_FILE")
+}
+#}}}
+
+_detect_compress_progs() { #{{{
+  PIGZ=`which pigz > /dev/null 2>&1`
+  PBZIP2=`which pbzip2 > /dev/null 2>&1`
+
+  [[ "$PIGZ" ]]   && echo "Detected pigz. : $PIGZ" >&5
+  [[ "$PBZIP2" ]] && echo "Detected pbzip2. : $PBZIP2" >&5
+}
+#}}}
+
+_get_archive_base() { #{{{
+  # BASE: /backup
+  # ex /home/alice
+  # /backup/home.alice
+  local TARGET_DIR="$1"
+  $SED "s|^/+||;s|/+|.|g;s|^|${_BACKUP_BASE}|" <<<"$TARGET_DIR"
+}
+#}}}
+
+_get_archive_ext() { #{{{
+  case "$1" in
+    tar)    echo .tar ;;
+    gz)     echo .tar.gz ;;
+    bz2)    echo .tar.bz2 ;;
+    xz)     echo .tar.xz ;;
+  esac
+}
+#}}}
+
+_get_archive_opt() { #{{{
+  case "$1" in
+    tar) echo '' ;;
+    gz)  [[ "$PIGZ" ]] && echo "--use-compress-prog=$PIGZ" || echo -z ;;
+    bz2) [[ "$PBZIP2" ]] && echo "--use-compress-prog=$PBZIP2" || echo -j ;;
+    xz)  echo -J ;;
+  esac
+}
+#}}}
+
+_get_archive_base() { #{{{
+  local TARGET_DIR="$1"
+  $SED "s|^/+||;s|/+|.|g;s|^|${_BACKUP_BASE}|" <<<"$TARGET_DIR"
+}
+#}}}
+
+_get_archive_name() { #{{{
+  # ex /var/lib/aaa ==> var.lib.aaa_yyyymmdd-hhmmss.ARC_TYPE
+  local TARGET_DIR="$1"
+  local ARC_EXT=`_get_archive_ext "$2"`
+  local DATE_SUFFIX=`date "$_ARCHIVE_SUFFIX"`
+  $SED "s|^/+||;s|/+|.|g;s|$|${DATE_SUFFIX}${ARC_EXT}|" <<<"$TARGET_DIR"
+}
+#}}}
+
+_prepare_backup_base() { #{{{
+  local BACKUP_BASE="$1"
+  [[ -d "$BACKUP_BASE" ]] && return 0
+  [[ ${REMOTE_PROTO:-} ]] && return 0
+
+  if [[ ! $_DRY_RUN ]]; then
+    mkdir -p $BACKUP_BASE || __error_end "Failed to create backup base directory. : $BACKUP_BASE"
+    echo "Backup base directory created. : $BACKUP_BASE"
+  else
+    echo "(dry-run) prepareing $BACKUP_BASE"
+  fi
+}
+#}}}
+
+_parse_opts() { #{{{
+  local E LONG_OPT_NAME OPT_ARG=()
+  for E in $OPTS; do
+    if [[ $E =~ --[a-zA-Z0-9_]+ ]]; then
+      [[ "$LONG_OPT_NAME" ]] && _parse_opts_sub ${LONG_OPT_NAME} "${OPT_ARG[@]}"
+      LONG_OPT_NAME=$E
+      OPT_ARG=()
+    else
+      OPT_ARG+=($E)
+    fi
+  done
+  [[ "$LONG_OPT_NAME" ]] && _parse_opts_sub ${LONG_OPT_NAME} "${OPT_ARG[@]}"
+}
+#}}}
+
+_parse_opts_sub() { #{{{
+  local ARGS=($@) LONG_OPT_NAME="$1"
+  _TAR_DEFAULT_OPTS=()
+
+  # shift ARGS
+  unset ARGS[0]
+  ARGS=(${ARGS[@]})
+
+  local FUNC_NAME=_longopt_`$SED 's/^--//' <<<${LONG_OPT_NAME}`
+  # check function existence
+  if ! type ${FUNC_NAME} > /dev/null 2>&1; then
+    echo "[Warning] unknown option: ${LONG_OPT_NAME}"
+    return 1
+  fi
+  # call function
+  ${FUNC_NAME} "${ARGS[@]}"
+  return $?
+}
+#}}}
+
+_prepare_includes_file() { #{{{
+  [[ ! "$_INCLUDES_FILE" ]] && _INCLUDES_FILE=`__make_tempfile`
+}
+#}}}
+
+_longopt_include() { #{{{
+  _prepare_includes_file
+
+  # add specified paths
+  local P
+  for P in $@; do
+    echo "$P" >> $_INCLUDES_FILE
+  done
+}
+#}}}
+
+_prepare_excludes_file() { #{{{
+  [[ ! "$_EXCLUDES_FILE" ]] && _EXCLUDES_FILE=`__make_tempfile`
+}
+#}}}
+
+_longopt_exclude() { #{{{
+  _prepare_excludes_file
+
+  # add specified paths
+  local P
+  for P in $@; do
+    echo "$P" >> $_EXCLUDES_FILE
+  done
+}
+#}}}
+
+_longopt_exclude-size() { #{{{
+  local SIZE="$1"
+
+  if [[ ! $SIZE =~ [+-][0-9]+[kMGTP]?$ ]]; then
+    echo "Illegal size parameter: $SIZE" >&2
+    return 1
+  fi
+
+  _prepare_excludes_file
+  local TARGET_DIR_LEN=$((${#_TARGET_DIR} + 1))
+
+  local P
+  while read P; do
+    echo "${P:${TARGET_DIR_LEN}}" >> $_EXCLUDES_FILE
+  done < <(find "$_TARGET_DIR" -type f -size $SIZE)
+}
+#}}}
+
+_longopt_follow-symlink() { #{{{
+  _TAR_ADDITIONAL_OPTS+=(-h)
+}
+#}}}
+
+_longopt_generation() { #{{{
+  local GEN="$1"
+  if [[ ! $GEN =~ [0-9]+ || $GEN -lt 0 ]]; then
+    echo "Illegal generation. : $GEN" >&2
+    return 1
+  fi
+  _LOCAL_GENERATION=`expr $GEN + 0`
+}
+#}}}
+
+_make_sftpcp_arg() { #{{{
+  local SFTP_ARG=()
+  SFTP_ARG+=(-t ${SCRIPT_NAME})
+  [[ -v _VERBOSE ]] && SFTP_ARG+=(-v)
+  [[ -v _REMOTE_PORT ]] && SFTP_ARG+=(-P $_REMOTE_PORT)
+  [[ -v _IDENTITY_FILE ]] && SFTP_ARG+=(-i $_IDENTITY_FILE)
+  echo "${SFTP_ARG[@]}"
+}
+#}}}
+
+_deal_backup_item() { #{{{
+  # 設定ファイル1行分を読み込んでバックアップ処理
+  local LINE="$1"
+  local OPTS
+  read _TARGET_DIR OPTS <<<"$LINE"
+
+  if [[ -f "$_INCLUDES_FILE" ]]; then
+    rm $_INCLUDES_FILE
+    unset _INCLUDES_FILE
+  fi
+
+  if [[ -f "$_EXCLUDES_FILE" ]]; then
+    rm $_EXCLUDES_FILE
+    unset _EXCLUDES_FILE
+  fi
+
+  local ARC_TYPE=`$SED 's|([^:]+):(.+)|\1|' <<<"$_TARGET_DIR"`
+  _TARGET_DIR=`$SED 's|([^:]+):(.+)|\2|' <<<"$_TARGET_DIR"`
+
+  if [[ ! "$ARC_TYPE" ]]; then
+    echo "Archive type is not specified." >&2
+    return 1
+  fi
+
+  local ROTATE_ONLY
+  [[ "$ARC_TYPE" = "rotate" ]] && ROTATE_ONLY=yes
+
+  if [[ ! "$ROTATE_ONLY" && -z `_get_archive_ext "$ARC_TYPE"` ]]; then
+    echo "Invalid archive type : $ARC_TYPE" >&2
+    return 1
+  fi
+
+  # if _TARGET_DIR ends with '/.', exclude all sub directories.
+  if [[ $_TARGET_DIR =~ .+/\.$ ]]; then
+    _TARGET_DIR=`$SED 's|/\.$||' <<<"$_TARGET_DIR"`
+    local TARGET_DIR_LEN=$((${#_TARGET_DIR} + 1))
+    while read P; do
+      _longopt_exclude "${P:${TARGET_DIR_LEN}}"
+    done < <(find "$_TARGET_DIR" -mindepth 1 -maxdepth 1 -type d)
+  fi
+  
+  _LOCAL_GENERATION=
+  _parse_opts $OPTS
+
+  # do backup
+  [[ ! "$_ROTATE" && ! "$ROTATE_ONLY" ]] && _backup "$_TARGET_DIR" "$ARC_TYPE"
+  
+  # do rotate
+  if [[ "$_WITH_ROTATE" || "$_ROTATE" ]]; then
+    [[ ! "$_LOCAL_GENERATION" ]] && _LOCAL_GENERATION=$_GENERATION
+
+    if [[ "${_REMOTE_PROTO}" = sftp ]]; then
+      _rotate_sftp `_get_archive_base "$_TARGET_DIR"` $_LOCAL_GENERATION
+    else
+      _rotate `_get_archive_base "$_TARGET_DIR"` $_LOCAL_GENERATION
+    fi
+  fi
+}
+#}}}
+
+_backup() { #{{{
+  local TARGET_DIR="$1"
+  local ARC_TYPE="$2"
+  local BACKUP_DST_DIR=`_get_archive_base "$TARGET_DIR"`
+  local BACKUP_FILE_NAME=`_get_archive_name "$TARGET_DIR" "$ARC_TYPE"`
+  local BACKUP_DST_PATH
+  if [[ "$_BACKUP_TMP_DIR" ]]; then
+    BACKUP_DST_PATH="${_BACKUP_TMP_DIR}/${BACKUP_FILE_NAME}"
+  else
+    BACKUP_DST_PATH="${BACKUP_DST_DIR}/${BACKUP_FILE_NAME}"
+  fi
+
+  #-----------------------------------
+  # prepare backup destination directory
+  # TODO この処理未テスト
+  _prepare_backup_base "$BACKUP_DST_DIR" \
+    || { echo "Unable to make ${BACKUP_DST_DIR}, Backup skipped. : $TARGET_DIR" >&2; return 1; }
+
+  ls "${TARGET_DIR}" > /dev/null 2>&1 \
+    || { echo "Unable to read ${TARGET_DIR}, Backup skipped." >&2; return 1; }
+
+  # estimate mode
+  if [[ $_ESTIMATE ]]; then
+    _estimate "${TARGET_DIR}" "${BACKUP_DST_PATH}"
+    return 0
+  fi
+
+  if [[ $_DRY_RUN ]]; then
+    _list_target "${TARGET_DIR}" "${BACKUP_DST_PATH}"
+    return 0
+  fi
+
+  #-----------------------------------
+  # do backup according to the archvie type
+  _backup_tar "${TARGET_DIR}" "${BACKUP_DST_PATH}" `_get_archive_opt $ARC_TYPE`
+
+  #-----------------------------------
+  # move
+  if [[ "$_BACKUP_TMP_DIR" ]]; then
+    local TMP_FILE=${BACKUP_DST_PATH}
+    BACKUP_DST_PATH="${BACKUP_DST_DIR}/${BACKUP_FILE_NAME}"
+
+    if [[ "${_REMOTE_PROTO}" = sftp ]]; then
+      #--------------------------------
+      # move by sftpcp
+      #--------------------------------
+      local URI="${_REMOTE_PROTO}://${_REMOTE_USER}@${_REMOTE_HOST}:${_REMOTE_PORT}:${BACKUP_DST_DIR}"
+      echo -e "${C_CYAN}Transfering...${C_OFF} : $TMP_FILE -> ${URI}"
+      
+      local SFTP_ARG=(`_make_sftpcp_arg` -k -m)
+      SFTP_ARG+=("${TMP_FILE}" "${_REMOTE_USER}@${_REMOTE_HOST}:${BACKUP_DST_DIR}")
+
+      echo "$_SFTPCP ${SFTP_ARG[@]}" >&5
+      $_SFTPCP ${SFTP_ARG[@]} >&5
+      if [[ $? -eq 0 ]]; then
+        echo "  [ ${C_GREEN}OK${C_OFF} ] Successfully transfered. : ${BACKUP_DST_PATH}"
+      else
+        echo "Transfer file failed. : ${TMP_FILE}" >&2
+      fi
+    else
+      #--------------------------------
+      # move by mv command
+      #--------------------------------
+      echo -e "${C_CYAN}Moving...${C_OFF} : $TMP_FILE -> ${BACKUP_DST_DIR}"
+      mv "$TMP_FILE" "${BACKUP_DST_DIR}/"
+      if [[ $? -eq 0 && -f ${BACKUP_DST_PATH} ]]; then
+        echo "${C_GREEN}Successfully moved.${C_OFF} : ${BACKUP_DST_PATH}"
+      else
+        echo "Moving file failed. : ${TMP_FILE}" >&2
+      fi
+    fi
+  fi
+}
+#}}}
+
+_build_tar_opts() { #{{{
+  local SRC_DIR="$1" DST_FILE="$2" ARC_OPT="$3"
+
+  TAR_OPTS=()
+  TAR_OPTS+=(-C / ${ARC_OPT} -c -f ${DST_FILE})
+  [[ -f $_INCLUDES_FILE ]] && TAR_OPTS+=(-T $_INCLUDES_FILE)
+  [[ -f $_EXCLUDES_FILE ]] && TAR_OPTS+=(-X $_EXCLUDES_FILE)
+  TAR_OPTS+=(${_TAR_DEFAULT_OPTS[@]})
+  TAR_OPTS+=(${_TAR_ADDITIONAL_OPTS[@]})
+
+  # target directory
+  TAR_OPTS+=("`$SED 's|^/+||' <<<"$SRC_DIR"`")
+}
+#}}}
+
+_backup_tar() { #{{{
+  local SRC_DIR="$1"
+  local DST_FILE="$2"
+  local ARC_OPT="$3"
+
+  local TMP_DST_FILE=`dirname "$DST_FILE"`/.`basename "$DST_FILE"`
+  echo "TMP_DST_FILE: $TMP_DST_FILE" >&5
+
+  # build options
+  _build_tar_opts "${SRC_DIR}" - "${ARC_OPT}" 
+
+  echo "${C_CYAN}Archiving:${C_OFF} ${SRC_DIR}"
+  echo "tar ${TAR_OPTS[@]} > \"${DST_FILE}\"" >&5
+  if [[ -f $_INCLUDES_FILE ]]; then
+    local LINE
+    while read LINE; do
+      echo "includes: $LINE" >&5
+    done < $_INCLUDES_FILE
+  fi
+  if [[ -f $_EXCLUDES_FILE ]]; then
+    local LINE
+    while read LINE; do
+      echo "excludes: $LINE" >&5
+    done < $_EXCLUDES_FILE
+  fi
+
+  # do archive
+  local TAR_RET
+  local ELAPSED=`{ time tar ${TAR_OPTS[@]} > ${TMP_DST_FILE}; TAR_RET=$?; } 2>&1 | grep real | awk '{print $2}'`
+
+  # check result
+  if [[ $TAR_RET -ne 0 ]]; then
+    [[ -f "$TMP_DST_FILE" ]] && rm -f "$TMP_DST_FILE"
+    echo "  [ ${C_RED}FAILED${C_OFF} ] Failed to archive. (tar returned $TAR_RET) : ${DEST_FILE}" >&2
+    return 1
+  fi
+  if [[ -f "${TMP_DST_FILE}" ]]; then
+    local FILE_SIZE=`ls -lh ${TMP_DST_FILE} | awk '{print $5}'`
+    mv "${TMP_DST_FILE}" "${DST_FILE}"
+    echo "  [ ${C_GREEN}OK${C_OFF} ] $DST_FILE (${C_WHITE}size:${C_OFF} $FILE_SIZE ${C_WHITE}elapsed:${C_OFF} $ELAPSED)"
+  else
+    echo "  [ ${C_RED}FAILED${C_OFF} ] Failed to archive. (Destination file was not created.) : ${DEST_FILE}" >&2
+    return 1
+  fi
+}
+#}}}
+
+_list_target() { #{{{
+  local SRC_DIR="$1"
+  local DST_FILE="$2"
+
+  # build options
+  _TAR_ADDITIONAL_OPTS=(-v)
+  _build_tar_opts "${SRC_DIR}" /dev/null
+
+  echo "(dry-run) ${C_CYAN}Archiving:${C_OFF} ${SRC_DIR} ${C_BLUE}-->${C_OFF} ${DST_FILE}"
+  echo "tar ${TAR_OPTS[@]} > \"${DST_FILE}\"" >&5
+  if [[ -f $_INCLUDES_FILE ]]; then
+    local LINE
+    while read LINE; do
+      echo "includes: $LINE" >&5
+    done < $_INCLUDES_FILE
+  fi
+  if [[ -f $_EXCLUDES_FILE ]]; then
+    local LINE
+    while read LINE; do
+      echo "excludes: $LINE" >&5
+    done < $_EXCLUDES_FILE
+  fi
+
+  if [[ $_VERBOSE ]]; then
+    tar ${TAR_OPTS[@]} | $SED 's/^/  /' >&3 
+  fi
+}
+#}}}
+
+_estimate() { #{{{
+  # estimate target size
+  local SRC_DIR="$1"
+  local DST_FILE="$2"
+
+  # build options
+  _build_tar_opts "${SRC_DIR}" -
+
+  echo "${C_CYAN}Estimating...${C_OFF} : ${SRC_DIR}"
+  echo "tar ${TAR_OPTS[@]} 2> /dev/null | wc -c | $SED 's/^ +//'" >&5
+  local SIZE=`tar ${TAR_OPTS[@]} 2> /dev/null | wc -c | $SED 's/^ +//'`
+  which numfmt > /dev/null 2>&1 && SIZE=`numfmt --to=si $SIZE`
+  echo "${SRC_DIR} : $SIZE"
+}
+#}}}
+
+_rotate() { #{{{
+  local TARGET_DIR="$1"
+  local GENERATION="$2"
+  local PREFIX
+
+  [[ "$_DRY_RUN" ]] && PREFIX='(dry-run) '
+  echo "${PREFIX}${C_CYAN}Rotating:${C_OFF} gen=$GENERATION $TARGET_DIR"
+  if [[ ! -d "$TARGET_DIR" ]]; then
+    echo "rotate target directory not found. : $TARGET_DIR" >&2
+    return 1
+  fi
+
+  pushd "$TARGET_DIR" > /dev/null || return 1
+
+  while read F; do
+    if [[ ! $_DRY_RUN ]]; then
+      rm -v "$F"
+    else
+      echo "(dry-run) Will be deleted. : $F"
+    fi
+  done < <($_FIND . -maxdepth 1 -mindepth 1 -type f -regex "$_ROTATE_TARGET_PATTERN" | sort | head --lines "-$GENERATION")
+
+  popd > /dev/null
+}
+#}}}
+
+_rotate_sftp() { #{{{
+  local TARGET_DIR="$1"
+  local GENERATION="$2"
+  local PREFIX
+  local URI="${_REMOTE_PROTO}://${_REMOTE_USER}@${_REMOTE_HOST}:${_REMOTE_PORT}:${TARGET_DIR}"
+
+  [[ "$_DRY_RUN" ]] && PREFIX='(dry-run) '
+  echo "${PREFIX}${C_CYAN}Rotating:${C_OFF} gen=$GENERATION $URI"
+
+  local SFTP_ARG_LS=(ls -o 1tr `_make_sftpcp_arg`)
+  SFTP_ARG_LS+=("${_REMOTE_USER}@${_REMOTE_HOST}:${TARGET_DIR}")
+
+  local SFTP_ARG_RM=(rm `_make_sftpcp_arg`)
+  SFTP_ARG_RM+=("${_REMOTE_USER}@${_REMOTE_HOST}")
+
+  echo "$_SFTPCP ${SFTP_ARG_LS[@]} | egrep \"$_ROTATE_TARGET_PATTERN\" | head --lines -${GENERATION}" >&5
+
+  local CNT=0
+  while read F; do
+    CNT=$((CNT + 1))
+    if [[ ! $_DRY_RUN ]]; then
+      echo "$_SFTPCP ${SFTP_ARG_RM[@]}:${TARGET_DIR}/${F}" >&5
+      $_SFTPCP ${SFTP_ARG_RM[@]}:${TARGET_DIR}/${F}
+    else
+      echo "(dry-run) Will be deleted. : $F"
+    fi
+  done < <($_SFTPCP ${SFTP_ARG_LS[@]} | egrep "$_ROTATE_TARGET_PATTERN" | head --lines -${GENERATION})
+
+  echo "  [ ${C_GREEN}OK${C_OFF} ] ${PREFIX} Total ${CNT} file(s) rotated."
+}
+#}}}
+
+#-------------------------------------------------------------------------------
+#- Main process ----------------------------------------------------------------
+#-------------------------------------------------------------------------------
+#- setup -----------------------------------------------------------------------
+_setup
+
+#- Get options -----------------------------------------------------------------
+#{{{
+# Parse long options
+ARG_CNT=0
+for ARG in $@; do
+  [[ $ARG =~ ^--[a-zA-Z0-9-]+ ]] || break
+  ARG_CNT=$(($ARG_CNT + 1))
+  echo "${_LONG_OPT_NAMES[@]}" | tr ' ' "\n" | grep -Eq -- "^${ARG}$" || { echo "Unknown option. : $ARG" >&2; continue; }
+  ARG=`tr [a-z] [A-Z] <<<"${ARG:2}" | sed -e 's/-/_/g' `
+  eval "_$ARG=yes; readonly _$ARG"
+done
+shift $ARG_CNT
+
+[[ ! "$_NO_COLOR" ]] && [[ ! "$_SILENT" ]] && __setup_color
+[[ "$_HELP" ]] && _usage
+[[ "$_ESTIMATE" ]] && _DRY_RUN=yes
+
+while getopts c:Dh OPT; do
+  case "$OPT" in
+    c) readonly _CONF_FILE_PATH=$OPTARG
+      ;;
+    D) readonly _DRY_RUN=yes
+      ;;
+    h|\?) _usage
+      ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+
+_setup_out
+#}}}
+
+#- Main process ----------------------------------------------------------------
+echo "${C_CYAN}process start.${C_OFF}"
+
+_detect_compress_progs
+_load_conf
+
+[[ $# -eq 0 ]] && _usage "backup list files are not specified."
+for LIST_FILE in "$@"; do
+  while read LINE; do
+    _deal_backup_item "$LINE"
+  done < <(_read_backuplist "$LIST_FILE")
+done
+
+# vim: ts=2 sw=2 sts=2 et nu foldmethod=marker

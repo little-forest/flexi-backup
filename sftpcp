@@ -1,0 +1,476 @@
+#!/bin/bash -u
+#===============================================================================
+# sftpcp :
+# Date    :  2019/01/20 Start
+# Copyright: Original code by Yusuke Komori.
+#                       Copyright (c) 2019. Yusuke Komori, All rights reserved.
+#===============================================================================
+
+#-------------------------------------------------------------------------------
+#- common global variables -----------------------------------------------------
+__SCRIPT_BASE=`echo $(cd $(dirname $0); pwd)`
+__SCRIPT_NAME=`basename $0`
+
+#-------------------------------------------------------------------------------
+#- global variables ------------------------------------------------------------
+#readonly _SSH_COMMON_OPT=(-oStrictHostKeyChecking=no -oUpdateHostKeys=yes -oUserKnownHostsFile=/dev/null)
+# openssh6.6 では updatehostkeysオプションが存在しない
+readonly _SSH_COMMON_OPT=(-oStrictHostKeyChecking=no -oUserKnownHostsFile=/dev/null)
+
+#-------------------------------------------------------------------------------
+#- common functions ------------------------------------------------------------
+#{{{
+__setup() { #{{{
+  tty -s || _SILENT=yes
+
+  sed --version 2>/dev/null | grep -q 'GNU sed' && SED='sed -re' || SED='sed -Ee'
+  readonly SED
+}
+#}}}
+
+__setup_color() { #{{{
+  local C
+  local COLOR=(BLACK RED GREEN YELLOW BLUE MAGENTA CYAN WHITE)
+  local STYLE=(OFF BOLD REV UL)
+
+  # define enpty valiable
+  for C in ${STYLE[@]}; do
+    eval "C_${C}="
+  done
+  for C in ${COLOR[@]}; do
+    eval "C_${C}="
+    eval "C_B_${C}="
+  done
+
+  tty -s || return
+  C_OFF=`tput sgr0`   # Reset attribute
+  C_BOLD=`tput bold`
+  C_REV=`tput rev`    # Reverse mode
+  C_UL=`tput smul`    # Underline mode
+
+  # Background
+  C_B_BLACK=`tput setab 0`
+  C_B_RED=`tput setab 1`
+  C_B_GREEN=`tput setab 2`
+  C_B_YELLOW=`tput setab 3`
+  C_B_BLUE=`tput setab 4`
+  C_B_MAGENTA=`tput setab 5`
+  C_B_CYAN=`tput setab 6`
+  C_B_WHITE=`tput setab 7`
+
+  # Foreground
+  C_BLACK=`tput setaf 0`
+  C_RED=`tput setaf 1`
+  C_GREEN=`tput setaf 2`
+  C_YELLOW=`tput setaf 3`
+  C_BLUE=`tput setaf 4`
+  C_MAGENTA=`tput setaf 5`
+  C_CYAN=`tput setaf 6`
+  C_WHITE="${C_BOLD}`tput setaf 7`"
+}
+#}}}
+
+__move_col() { #{{{
+  [[ -v _SILENT ]] && return
+  tput hpa "$1"
+}
+#}}}
+
+__syslog() { #{{{
+  local TAG="${LOG_TAG:-}${LOG_TAG:+/}${__SCRIPT_NAME}"
+  local FACILITY=${LOG_FACILITY:-user}
+  local LOG_LEVEL=${2:-info}
+
+  if [[ $# -ge 1 ]]; then
+    logger -t "$TAG" -p "${FACILITY}.${LOG_LEVEL}" "$1"
+  else
+    local OLDIFS="$IFS"
+    IFS=
+    while read LOG_LINE; do
+      logger -t "$TAG" -p "${FACILITY}.${LOG_LEVEL}" "$LOG_LINE"
+    done
+    IFS="$OLDIFS"
+  fi
+}
+#}}}
+
+__show_ok() { #{{{
+  [[ -v _SILENT ]] && return
+  [[ "$1" && "$1" -gt 0 ]] && echo -en "\\033[${1}G"
+  echo -en "[ ${C_GREEN}OK${C_OFF}"
+  [ "$2" ] && echo " ]$2" || echo " ]"
+}
+#}}}
+
+__show_info() { #{{{
+  [[ -v _SILENT ]] && return
+  [[ "$1" == "-n" ]] && echo -en "${C_CYAN}${2}${C_OFF}" || echo -e "${C_CYAN}${1}${C_OFF}"
+}
+#}}}
+
+__show_error() { #{{{
+  local MSG="$1"
+  if [[ -z "$MSG" ]]; then
+    MSG=`$SED '/^[ \t]*$/d' | tr -d "\n"`
+  fi
+  tty -s || __syslog "[ERROR] $MSG" 'error'
+  echo -e "[${C_RED}ERROR${C_OFF}] $MSG" >&2
+}
+#}}}
+
+__error_end() { #{{{
+  __show_error "$1"; exit 1
+}
+#}}}
+#}}}
+
+#-------------------------------------------------------------------------------
+#- functions -------------------------------------------------------------------
+
+_usage() { #{{{
+  [[ "${1:-}" ]] && __show_error "$1"
+  if tty -s; then :; else
+    [[ "${1:-}" ]] && __syslog "ERROR: $1" 'err'
+  fi
+  echo "usege : $__SCRIPT_NAME [cp] [-P PORT] [-t SYSLOG_TAG] [-i IDENTITY_FILE] [-pkmvh] SRC USER@HOST:DEST"
+  echo '  copy file'
+  echo '          -P : specify remote Port'
+  echo '          -l : sftp Login only'
+  echo '          -t : syslog tag'
+  echo '          -i : Identity (private key) file'
+  echo '          -p : Preserve all permisstions'
+  echo '          -k : maKe remote directory'
+  echo '          -m : Move file (if succeeded)'
+  echo '          -v : Verbose'
+  echo '          -h : display usage'
+  echo 
+  echo "usege : $__SCRIPT_NAME login [-P PORT] [-t SYSLOG_TAG] [-i IDENTITY_FILE] USER@HOST"
+  echo '  login only'
+  echo 
+  echo "usege : $__SCRIPT_NAME ls [-P PORT] [-t SYSLOG_TAG] [-i IDENTITY_FILE] [-o LS_OPT] USER@HOST:PATH"
+  echo '  list files'
+  echo '          -o : sftp ls options (-1afhlnrSt)'
+  echo 
+  echo "usege : $__SCRIPT_NAME rm [--dry-run] [-P PORT] [-t SYSLOG_TAG] [-i IDENTITY_FILE] USER@HOST:PATH"
+  echo '  remote file'
+  echo 
+  [[ "${1:-}" ]] && exit 1 || exit 0
+}
+#}}}
+
+_script_end() { #{{{
+  :
+}
+trap '_script_end' EXIT
+#}}}
+
+_log() { #{{{
+  [[ -v VERBOSE ]] && echo -e "$1"
+  if [[ -v LOG_TAG ]]; then
+    echo "$1" | sed -r "s:\x1B[\(\)][AB012]::g;s:\x1B\[([0-9]{1,2}(;[0-9]{1,2})*)?m::g" | __syslog
+  fi
+}
+#}}}
+
+_sftp_ls() { #{{{
+  local DIR="$1"
+  local LS_ARG="${2:-}"
+  [[ "$DIR" = - ]] && DIR=
+  [[ "$DIR" ]] && local CD_CMD="cd $DIR" || local CD_CMD=""
+
+  local SFTP_ARG=(`_make_sftp_arg`)
+  sftp ${SFTP_ARG[@]} <<SFTP_CMD | sed -re '/^sftp>/d'
+${CD_CMD}
+ls $LS_ARG
+exit
+SFTP_CMD
+  return $?
+}
+#}}}
+
+_sftp_put() { #{{{
+  local FILE="$1"
+  local REMOTE_DIR="$2"
+  local PUT_ARG="$3"
+  [[ "$REMOTE_DIR" ]] && local CD_CMD="cd $REMOTE_DIR" || local CD_CMD=""
+  _log "${C_CYAN}Uploading file :${C_OFF} $FILE to ${_REMOTE_USER}@${_REMOTE_HOST}:${REMOTE_DIR}"
+  _sftp_exec <<SFTP_CMD
+${CD_CMD}
+put $PUT_ARG $FILE
+exit
+SFTP_CMD
+  return $?
+}
+#}}}
+
+_sftp_existdir() { #{{{
+  local DIR="$1" 
+  _log "${C_CYAN}Checking remote directory :${C_OFF} $DIR"
+  _sftp_exec <<SFTP_CMD
+cd $DIR
+exit
+SFTP_CMD
+  return $?
+}
+#}}}
+
+_sftp_mkdir() { #{{{
+  local DIR="$1"
+  _log "${C_CYAN}Creating remote directory :${C_OFF} $DIR"
+  _sftp_exec <<SFTP_CMD
+mkdir $DIR
+exit
+SFTP_CMD
+  return $?
+}
+#}}}
+
+_sftp_verify() { #{{{
+  local DEST_DIR="$1"
+  local FILE_NAME="$2"
+  [[ "$DEST_DIR" ]] && local CD_CMD="cd $DEST_DIR" || local CD_CMD=""
+  _log "${C_CYAN}Verifying file :${C_OFF} ${_REMOTE_USER}@${_REMOTE_HOST}:${DEST_DIR}/${FILE_NAME}"
+  _sftp_exec <<SFTP_CMD
+${CD_CMD}
+ls $FILE_NAME
+exit
+SFTP_CMD
+  return $?
+}
+#}}}
+
+_sftp_rm() { #{{{
+  local TARGET_PATH="$1"
+  [[ -v _DRY_RUN ]] && local PREFIX='(dry-run) '
+  _log "${PREFIX:-}${C_CYAN}Deleting file :${C_OFF} ${_REMOTE_USER}@${_REMOTE_HOST}:${TARGET_PATH}"
+  [[ -v _DRY_RUN ]] && return 0
+  _sftp_exec <<SFTP_CMD
+rm $TARGET_PATH
+exit
+SFTP_CMD
+  return $?
+}
+#}}}
+
+_make_sftp_arg() { #{{{
+  local SSH_OPT=(${_SSH_COMMON_OPT[@]})
+  [[ -v _REMOTE_PORT ]] && SSH_OPT+=(-oPort=${_REMOTE_PORT})
+  [[ -v _IDENTITY_FILE ]] && SSH_OPT+=(-i ${_IDENTITY_FILE})
+  echo "-q -b - ${SSH_OPT[@]} ${_REMOTE_USER}@${_REMOTE_HOST}"
+}
+#}}}
+
+_sftp_exec() { #{{{
+  local SFTP_ARG=(`_make_sftp_arg`)
+
+  if [[ ! -v VERBOSE ]]; then
+    if [[ ! -v LOG_TAG ]]; then
+      sftp ${SFTP_ARG[@]} > /dev/null 2>&1
+      local RET=$?
+    else
+      # syslogging
+      sftp ${SFTP_ARG[@]} 2>&1 | sed -re 's/^/  /g' | __syslog
+      local RET="${PIPESTATUS[0]}"
+    fi
+    return $RET
+  else
+    sftp ${SFTP_ARG[@]} 2>&1 | sed -re 's|^(sftp> )|\x1b[0;32m\1\x1b[0;39m|'
+    local RET="${PIPESTATUS[0]}"
+    return $RET
+  fi
+}
+#}}}
+
+_sftp_login() { #{{{
+  local SSH_OPT=(${_SSH_COMMON_OPT[@]})
+  [[ -v _REMOTE_PORT ]] && SSH_OPT+=(-oPort=${_REMOTE_PORT})
+  [[ -v _IDENTITY_FILE ]] && SSH_OPT+=(-i ${_IDENTITY_FILE})
+  local SFTP_ARG="${SSH_OPT[@]} ${_REMOTE_USER}@${_REMOTE_HOST}"
+  sftp $SFTP_ARG
+  return $?
+}
+#}}}
+
+_parse_user_host_dir() { #{{{
+  # ${_REMOTE_USER}@${_REMOTE_HOST}[:${_REMOTE_DIR}]
+  _REMOTE_USER=`echo $1 | sed -nre 's/([^@]+)@([^:]+):?(.*)/\1/p'`
+  _REMOTE_HOST=`echo $1 | sed -nre 's/([^@]+)@([^:]+):?(.*)/\2/p'`
+  _REMOTE_DIR=`echo $1 | sed -nre 's/([^@]+)@([^:]+):?(.*)/\3/p'`
+  [[ ! -v _REMOTE_USER || ! "$_REMOTE_USER" ]] && _usage "REMOTE_USER is not specified."
+  [[ ! -v _REMOTE_HOST || ! "$_REMOTE_HOST" ]] && _usage "REMOTE_HOST is not specified."
+}
+#}}}
+
+#-------------------------------------------------------------------------------
+#- Main process ----------------------------------------------------------------
+#-------------------------------------------------------------------------------
+#- setup -----------------------------------------------------------------------
+__setup
+
+#- Get options -----------------------------------------------------------------
+
+# parse subcommand #{{{
+case "${1:-}" in
+  cp|ls|rm|login) SUBCMD="$1" ;;
+esac
+[[ -v SUBCMD ]] && shift 1
+[[ -v SUBCMD ]] || SUBCMD=cp
+
+CMDOPT=
+case $SUBCMD in
+  cp) CMDOPT=pkm ;;
+  ls) CMDOPT=o: ;;
+esac
+#}}}
+
+# parse long options #{{{
+# __LONG_OPT_NAMES 配列に登録されたロングオプションが指定されると、
+# 対応する変数に yes が設定されます。
+#   例) --verbose ==> _VERBOSE=yes
+readonly __LONG_OPT_NAMES=(--silent --no-color --verbose --dry-run --help)
+
+ARG_CNT=0
+for ARG in $@; do
+  [[ $ARG =~ ^--[a-zA-Z0-9-]+ ]] || break
+  ARG_CNT=$(($ARG_CNT + 1))
+  echo "${__LONG_OPT_NAMES[@]}" | tr ' ' "\n" | grep -Eq -- "^${ARG}$" || { echo "Unknown option. : $ARG" >&2; continue; }
+  ARG=`tr [a-z] [A-Z] <<<"${ARG:2}" | sed -e 's/-/_/g' `
+  eval "_$ARG=yes; readonly _$ARG"
+done
+shift $ARG_CNT
+
+[[ ! -v _NO_COLOR ]] && __setup_color
+
+[[ -v _HELP ]] && _usage
+#}}}
+
+# parse common short options #{{{
+while getopts "P:t:i:vh${CMDOPT}" OPT; do
+  case "$OPT" in
+    P) _REMOTE_PORT="$OPTARG"
+      ;;
+    t) LOG_TAG="$OPTARG"
+      ;;
+    i) _IDENTITY_FILE="$OPTARG"
+      ;;
+    v) VERBOSE=yes
+      ;;
+    #-- cp ----------------------------
+    p) PUT_ARG="-P "
+      ;;
+    k) MKDIR=yes
+      ;;
+    m) MOVE_FILE=yes
+      ;;
+    #-- ls ----------------------------
+    o) LS_OPT="-${OPTARG}"
+      ;;
+    h|?) _usage
+      ;;
+  esac
+done
+shift `expr $OPTIND - 1`
+#}}}
+
+# SUB command: login #{{{
+if [[ "$SUBCMD" = login ]]; then
+  [[ $# -lt 1 ]] && _usage "login: Not enough arguments."
+  _parse_user_host_dir $1
+  _sftp_login
+  exit $?
+fi
+#}}}
+
+# SUB command: list files #{{{
+if [[ "$SUBCMD" = ls ]]; then
+  [[ $# -lt 1 ]] && _usage "ls: Not enough arguments."
+  _parse_user_host_dir $1
+  [[ "$_REMOTE_DIR" ]] && LS_DIR=${_REMOTE_DIR} || LS_DIR=-
+  _sftp_ls ${LS_DIR} ${LS_OPT:-}
+  exit $?
+fi
+#}}}
+
+# SUB command: remove #{{{
+if [[ "$SUBCMD" = rm ]]; then
+  [[ $# -lt 1 ]] && _usage "rm: Not enough arguments."
+  _parse_user_host_dir $1
+  [[ ! "$_REMOTE_DIR" ]] && _usage "Not enogh arguments."
+  _sftp_rm "$_REMOTE_DIR"
+  RM_RET=$?
+  [[ $RM_RET -eq 0 ]] && __syslog "sftpcp success"
+  exit $RM_RET
+fi
+#}}}
+
+# SUB command: cp
+#- Check options ---------------------------------------------------------------
+#{{{
+[[ "$#" -lt 2 ]] && _usage "cp: Not enough arguments."
+SRC="${1:-}"
+DEST_ARG="${2:-}"
+SRC_FILE=`basename $SRC`
+
+[[ ! -f "$SRC" ]] && ( echo "Source file not found. : $SRC" >&2; exit 1; )
+
+_REMOTE_USER=`echo $DEST_ARG | sed -re 's/([^@]+)@([^:]+):(.*)/\1/'`
+_REMOTE_HOST=`echo $DEST_ARG | sed -re 's/([^@]+)@([^:]+):(.*)/\2/'`
+_DEST_DIR=`echo $DEST_ARG | sed -re 's/([^@]+)@([^:]+):(.*)/\3/'`
+
+[[ ! -v _REMOTE_USER ]] && _usage "REMOTE_USER is not specified."
+[[ ! -v _REMOTE_HOST ]] && _usage "REMOTE_HOST is not specified."
+[[ -v _IDENTITY_FILE ]] && [[ ! -f "$_IDENTITY_FILE" ]] && __error_end "Identity file is not found. : $_IDENTITY_FILE" 
+
+__syslog "sftpcp : $SRC ==> ${_REMOTE_USER}@${_REMOTE_HOST}:${_DEST_DIR}"
+#}}}
+
+#- Main process ----------------------------------------------------------------
+# create remote dir #{{{
+if [[ -v MKDIR ]]; then
+  set +e
+  _sftp_existdir "$_DEST_DIR"; RET=$?
+  set -e
+  if [[ ! "$RET" -eq 0 ]]; then
+    _sftp_mkdir "$_DEST_DIR"
+    RET=$?
+    if [[ ! "$RET" -eq 0 ]]; then
+      __show_error "Failed to create remote directory. : $_DEST_DIR" 1>&2
+      __syslog "[ERROR] Failed to create remote directory. : $_DEST_DIR"
+      exit $RET
+    fi
+  fi
+fi
+#}}}
+
+# do copy #{{{
+PUT_ARG=${PUT_ARG:=}
+_sftp_put "$SRC" "$_DEST_DIR" "$PUT_ARG"
+SFTP_RESULT=$?
+if [[ ! "$SFTP_RESULT" -eq 0 ]]; then
+  MSG="Failed to sftp copy. : $SRC to ${_REMOTE_USER}@${_REMOTE_HOST}:${_DEST_DIR}"
+  __show_error "$MSG" 1>&2
+  __syslog "[ERROR] $MSG"
+  exit $SFTP_RESULT
+fi
+#}}}
+
+# check if copy was successful #{{{
+_sftp_verify "$_DEST_DIR" "$SRC_FILE"
+VERIFY_RET="$?"
+if [[ ! "$VERIFY_RET" -eq 0 ]]; then
+  # failed
+  _log "${C_RED}[ERROR]${C_OFF} Verify failed."
+  exit $VERIFY_RET
+else
+  # successful, delete source file
+  if [[ -v MOVE_FILE ]]; then
+    _log "${C_CYAN}Removing source file :${C_OFF} $SRC"
+    rm -f "$SRC"
+  fi
+fi
+__syslog "sftpcp success"
+#}}}
+
+exit 0
+
+# vim: ts=2 sw=2 sts=2 et nu foldmethod=marker
