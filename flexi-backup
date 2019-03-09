@@ -28,7 +28,7 @@ _BACKUP_BASE=
 _BACKUP_TMP_DIR=
 _GENERATION=
 _ARCHIVE_SUFFIX='+_%Y%m%d-%H%M%S'
-_ROTATE_TARGET_PATTERN='.+_[0-9]+-[0-9]+\.tar(.[a-zA-Z0-9]+)?'
+_ROTATE_TARGET_PATTERN='.+_[0-9]+-[0-9]+\.tar(\.[a-zA-Z0-9]+)?$'
 
 _REMOTE_PROTO=
 _REMOTE_HOST=
@@ -181,7 +181,7 @@ _usage() { #{{{
   local LONG_OPTIONS=`$SED 's/([a-zA-Z0-9-]+)/[\1]/g' <<<"${_LONG_OPT_NAMES[@]}"`
 
   cat <<EOM
-${C_WHITE}usage${C_OFF} : $SCRIPT_NAME [OPTIONS] [-c CONF_FILE_PATH] [-DR] FILES or DIRS...
+${C_WHITE}usage${C_OFF} : $SCRIPT_NAME [OPTIONS] [-c CONF_FILE_PATH] [-DR] [-r GENERATION] FILES or DIRS...
     --silent      : 標準出力を行いません. syslog出力は行います.ttyがない場合は自動的にsilentオプションが指定されます.
     --no-color    :
     --verbose     :
@@ -197,10 +197,15 @@ ${C_WHITE}usage${C_OFF} : $SCRIPT_NAME [OPTIONS] [-c CONF_FILE_PATH] [-DR] FILES
     -R
       引数で指定されたディレクトリ配下のバックアップファイルのうち、重複しているファイルを
       シンボリックリンクで置き換え、バックアップ要領を削減します.
+
+    -r GENERATION
+      指定されたディレクトリ配下のバックアップをローテートします.
+      GENERATION は、保存する世代数(1以上)です.
     
     FILES or DIRS
       バックアップ時: バックアップリストファイル(複数可)
       -R 指定時:      削減対象ディレクトリ(複数可)
+      -r 指定時:      ローテート対象ディレクトリ(複数可)
 
   ${C_WHITE}flexi-backup.conf${C_OFF} :
     BACKUP_BASE (mandatory)
@@ -774,7 +779,16 @@ _rotate() { #{{{
     else
       echo "(dry-run) Will be deleted. : $F"
     fi
-  done < <($_FIND . -maxdepth 1 -mindepth 1 -type f -regex "$_ROTATE_TARGET_PATTERN" | sort | head --lines "-$GENERATION")
+  done < <($_FIND . -maxdepth 1 -mindepth 1 -type f | egrep "$_ROTATE_TARGET_PATTERN" | sort | head --lines "-$GENERATION")
+
+  while read L; do
+    if [[ ! $_DRY_RUN ]]; then
+      rm -v "$L"
+    else
+      echo "(dry-run) Will be deleted symlink. : $L"
+    fi
+  done < <($_FIND . -maxdepth 1 -mindepth 1 -xtype l)
+
 
   popd > /dev/null
 }
@@ -934,11 +948,14 @@ shift $ARG_CNT
 [[ "$_ESTIMATE" ]] && _DRY_RUN=yes
 
 _SUBCMD=backup
-while getopts c:RDh OPT; do
+while getopts c:Rr:Dh OPT; do
   case "$OPT" in
     c) readonly _CONF_FILE_PATH=$OPTARG
       ;;
     R) _SUBCMD=reduce-deplicated
+      ;;
+    r) _SUBCMD=rotate
+       _ROTATE_GENERATION=$OPTARG
       ;;
     D) readonly _DRY_RUN=yes
       ;;
@@ -978,6 +995,21 @@ case "$_SUBCMD" in
       _make_hash "$TARGET_DIR"
       _replace_symbolic_link "$TARGET_DIR"
       echo "$? file(s) reduced."
+    done
+    ;;
+
+  rotate)
+    [[ $# -eq 0 ]] && _usage "Target directories are not specified."
+
+    # verify rotate generation
+    [[ "$_ROTATE_GENERATION" =~ [0-9]+ ]] || __error_end "Illegal generation. : $_ROTATE_GENERATION"
+    [[ "$_ROTATE_GENERATION" -ge 0 ]] || __error_end "Illegal generation. : $_ROTATE_GENERATION"
+    _ROTATE_GENERATION=$(($_ROTATE_GENERATION + 0))
+
+    for TARGET_DIR in "$@"; do
+      TARGET_DIR=`readlink -f $TARGET_DIR`
+      [[ ! -d "$TARGET_DIR" ]] && __error_end "Directory not found. : $TARGET_DIR"
+      _rotate $TARGET_DIR $_ROTATE_GENERATION
     done
     ;;
 esac
