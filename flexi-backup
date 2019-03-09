@@ -181,7 +181,7 @@ _usage() { #{{{
   local LONG_OPTIONS=`$SED 's/([a-zA-Z0-9-]+)/[\1]/g' <<<"${_LONG_OPT_NAMES[@]}"`
 
   cat <<EOM
-${C_WHITE}usage${C_OFF} : $SCRIPT_NAME [OPTIONS] [-c CONF_FILE_PATH] [-D] BACKUP_LIST...
+${C_WHITE}usage${C_OFF} : $SCRIPT_NAME [OPTIONS] [-c CONF_FILE_PATH] [-D] [-r REDUCE_DIR] BACKUP_LIST...
     --silent      : 標準出力を行いません. syslog出力は行います.ttyがない場合は自動的にsilentオプションが指定されます.
     --no-color    :
     --verbose     :
@@ -193,6 +193,10 @@ ${C_WHITE}usage${C_OFF} : $SCRIPT_NAME [OPTIONS] [-c CONF_FILE_PATH] [-D] BACKUP
 
     -c CONF_FILE_PATH
       コンフィグレーションファイルのパスを指定します.
+
+    -r REDUCE_DIR
+      指定されたディレクトリ配下のバックアップファイルのうち、重複しているファイルを
+      シンボリックリンクで置き換え、バックアップ要領を削減します.
 
   ${C_WHITE}flexi-backup.conf${C_OFF} :
     BACKUP_BASE (mandatory)
@@ -804,9 +808,18 @@ _rotate_sftp() { #{{{
 }
 #}}}
 
+_list_archives() { #{{{
+  local TARGET_DIR="$1"
+  if [[ ! -d "$TARGET_DIR" ]]; then
+    echo "(_list_archives) Directory not found. : $TARGET_DIR" >&2
+    return 1
+  fi
+  ls -1r ${TARGET_DIR}/*.tar{,.gz,.bz2,.xz} 2> /dev/null | sort
+}
+#}}}
+
 _make_hash() { #{{{
-  local TARGET="$1"
-  local TARGET_DIR=`dirname "$TARGET"`
+  local TARGET_DIR="$1"
   local HASH_CACHE=.hash_cache
 
   if [[ ! -d "$TARGET_DIR" ]]; then
@@ -826,7 +839,7 @@ _make_hash() { #{{{
       echo "calculating hash... : `readlink -f $FILE`"
       md5sum $FILE >> "$HASH_CACHE"
     fi
-  done < <(ls -1r $TARGET)
+  done < <(_list_archives "$TARGET_DIR")
 
   popd > /dev/null
 }
@@ -842,9 +855,9 @@ _get_hash() { #{{{
 #}}}
 
 _replace_symbolic_link() { #{{{
-  local TARGET="$1"
-  local TARGET_DIR=`dirname "$TARGET"`
+  local TARGET_DIR="$1"
   local ORGFILE FILE1 FILE2 HASH1 HASH2
+  local REDUCED_COUNT=0
 
   if [[ ! -d "$TARGET_DIR" ]]; then
     echo "(_replace_symbolic_link) ${TARGET_DIR} is not found." >&2
@@ -857,6 +870,14 @@ _replace_symbolic_link() { #{{{
 
     HASH1=`_get_hash $FILE1`
     HASH2=`_get_hash $FILE2`
+    if [[ ! "$HASH1" ]]; then
+      echo "(_replace_symbolic_link) Couldn't get hash. : $FILE1" >&2
+      continue
+    fi
+    if [[ ! "$HASH2" ]]; then
+      echo "(_replace_symbolic_link) Couldn't get hash. : $FILE2" >&2
+      continue
+    fi
     FILE1=`basename $FILE1`
     FILE2=`basename $FILE2`
     [[ $HASH1 != $HASH2 ]] && continue
@@ -867,15 +888,19 @@ _replace_symbolic_link() { #{{{
       if ln -s ${ORGFILE} ${FILE2}; then
         echo "replaced with symbolic link. $FILE2 => $ORGFILE"
         rm ${FILE2}.bak
+        REDUCED_COUNT=$(($REDUCED_COUNT + 1))
       else
         echo "(_replace_symbolic_link) failed to replace with symbolic link. $FILE2 => $ORGFILE"
         mv ${FILE2}.bak ${FILE2}
       fi
     else
       echo "(dry-run) Will be replaced with symbolic link. $FILE2 => $ORGFILE"
+      REDUCED_COUNT=$(($REDUCED_COUNT + 1))
     fi
-  done < <(paste <(ls -1 $TARGET | sort) <(ls -1 $TARGET | sort | sed -e 1d) | sed -e '$d')
+  done < <(paste <(_list_archives "$TARGET_DIR") <(_list_archives "${TARGET_DIR}" | sed -e 1d) | sed -e '$d')
   popd > /dev/null
+
+  return $REDUCED_COUNT
 }
 #}}}
 
@@ -902,9 +927,12 @@ shift $ARG_CNT
 [[ "$_HELP" ]] && _usage
 [[ "$_ESTIMATE" ]] && _DRY_RUN=yes
 
-while getopts c:Dh OPT; do
+while getopts c:r:Dh OPT; do
   case "$OPT" in
     c) readonly _CONF_FILE_PATH=$OPTARG
+      ;;
+    r) readonly _SUBCMD=replace-symlimk
+       readonly _REPLACE_TARGET="$OPTARG"
       ;;
     D) readonly _DRY_RUN=yes
       ;;
@@ -918,21 +946,26 @@ _setup_out
 #}}}
 
 #- Main process ----------------------------------------------------------------
-echo "${C_CYAN}process start.${C_OFF}"
 
-_detect_compress_progs
-_load_conf
+if [[ $_SUBCMD = 'replace-symlimk' ]]; then
+  [[ ! -d "$_REPLACE_TARGET" ]] && __error_end "Directory not found. : $_REPLACE_TARGET"
+  REPLACE_TARGET=`readlink -f $_REPLACE_TARGET`
+  echo "${C_CYAN}Reducing ${REPLACE_TARGET} ...${C_OFF}"
+  _make_hash "$REPLACE_TARGET"
+  _replace_symbolic_link "$REPLACE_TARGET"
+  echo "$? file(s) reduced."
+else
+  echo "${C_CYAN}process start.${C_OFF}"
 
-#TEST_DIR=/usr/local/pub-scripts/flexi-backup/etc/*.tar.bz2
-#_make_hash "$TEST_DIR"
-#_replace_symbolic_link "$TEST_DIR"
-#exit
+  _detect_compress_progs
+  _load_conf
 
-[[ $# -eq 0 ]] && _usage "backup list files are not specified."
-for LIST_FILE in "$@"; do
-  while read LINE; do
-    _deal_backup_item "$LINE"
-  done < <(_read_backuplist "$LIST_FILE")
-done
+  [[ $# -eq 0 ]] && _usage "backup list files are not specified."
+  for LIST_FILE in "$@"; do
+    while read LINE; do
+      _deal_backup_item "$LINE"
+    done < <(_read_backuplist "$LIST_FILE")
+  done
+fi
 
 # vim: ts=2 sw=2 sts=2 et nu foldmethod=marker
