@@ -825,6 +825,7 @@ _list_archives() { #{{{
 _make_hash() { #{{{
   local TARGET_DIR="$1"
   local HASH_CACHE=.hash_cache
+  local HASH
 
   if [[ ! -d "$TARGET_DIR" ]]; then
     echo "(_make_hash) ${TARGET_DIR} is not found." >&2
@@ -841,7 +842,8 @@ _make_hash() { #{{{
       :
     else
       echo "calculating hash... : `readlink -f $FILE`"
-      md5sum $FILE >> "$HASH_CACHE"
+      HASH=`tar tvf $FILE | sort | md5sum | awk '{print $1}'`
+      echo -e "${HASH}  ${FILE}" >> "$HASH_CACHE"
     fi
   done < <(_list_archives "$TARGET_DIR")
 
