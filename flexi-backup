@@ -804,6 +804,81 @@ _rotate_sftp() { #{{{
 }
 #}}}
 
+_make_hash() { #{{{
+  local TARGET="$1"
+  local TARGET_DIR=`dirname "$TARGET"`
+  local HASH_CACHE=.hash_cache
+
+  if [[ ! -d "$TARGET_DIR" ]]; then
+    echo "(_make_hash) ${TARGET_DIR} is not found." >&2
+    return 1
+  fi
+
+  pushd $TARGET_DIR > /dev/null
+
+  [[ ! -f "$HASH_CACHE" ]] && touch "$HASH_CACHE"
+
+  while read FILE; do
+    FILE=`basename $FILE`
+    if grep -q "${FILE}" <(awk '{print $2}' $HASH_CACHE); then
+      :
+    else
+      echo "calculating hash... : `readlink -f $FILE`"
+      md5sum $FILE >> "$HASH_CACHE"
+    fi
+  done < <(ls -1r $TARGET)
+
+  popd > /dev/null
+}
+#}}}
+
+_get_hash() { #{{{
+  local TARGET="$1"
+  local CACHE_FILE="`dirname $TARGET`/.hash_cache"
+  [[ ! -f "$CACHE_FILE" ]] && return 1
+  local PATTERN=`sed -re 's|\.|\\\\.|g' <<<"$(basename $TARGET)"`
+  egrep '[ \t]+'${PATTERN}'$' $CACHE_FILE | awk '{print $1}'
+}
+#}}}
+
+_replace_symbolic_link() { #{{{
+  local TARGET="$1"
+  local TARGET_DIR=`dirname "$TARGET"`
+  local ORGFILE FILE1 FILE2 HASH1 HASH2
+
+  if [[ ! -d "$TARGET_DIR" ]]; then
+    echo "(_replace_symbolic_link) ${TARGET_DIR} is not found." >&2
+    return 1
+  fi
+
+  pushd "$TARGET_DIR" > /dev/null
+  while read FILE1 FILE2; do
+    [[ -L $FILE2 ]] && continue
+
+    HASH1=`_get_hash $FILE1`
+    HASH2=`_get_hash $FILE2`
+    FILE1=`basename $FILE1`
+    FILE2=`basename $FILE2`
+    [[ $HASH1 != $HASH2 ]] && continue
+
+    ORGFILE=`readlink -f $FILE1`
+    if [[ ! "$_DRY_RUN" ]]; then
+      mv ${FILE2} ${FILE2}.bak
+      if ln -s ${ORGFILE} ${FILE2}; then
+        echo "replaced with symbolic link. $FILE2 => $ORGFILE"
+        rm ${FILE2}.bak
+      else
+        echo "(_replace_symbolic_link) failed to replace with symbolic link. $FILE2 => $ORGFILE"
+        mv ${FILE2}.bak ${FILE2}
+      fi
+    else
+      echo "(dry-run) Will be replaced with symbolic link. $FILE2 => $ORGFILE"
+    fi
+  done < <(paste <(ls -1 $TARGET | sort) <(ls -1 $TARGET | sort | sed -e 1d) | sed -e '$d')
+  popd > /dev/null
+}
+#}}}
+
 #-------------------------------------------------------------------------------
 #- Main process ----------------------------------------------------------------
 #-------------------------------------------------------------------------------
@@ -847,6 +922,11 @@ echo "${C_CYAN}process start.${C_OFF}"
 
 _detect_compress_progs
 _load_conf
+
+#TEST_DIR=/usr/local/pub-scripts/flexi-backup/etc/*.tar.bz2
+#_make_hash "$TEST_DIR"
+#_replace_symbolic_link "$TEST_DIR"
+#exit
 
 [[ $# -eq 0 ]] && _usage "backup list files are not specified."
 for LIST_FILE in "$@"; do
