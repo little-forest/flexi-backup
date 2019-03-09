@@ -181,7 +181,7 @@ _usage() { #{{{
   local LONG_OPTIONS=`$SED 's/([a-zA-Z0-9-]+)/[\1]/g' <<<"${_LONG_OPT_NAMES[@]}"`
 
   cat <<EOM
-${C_WHITE}usage${C_OFF} : $SCRIPT_NAME [OPTIONS] [-c CONF_FILE_PATH] [-D] [-r REDUCE_DIR] BACKUP_LIST...
+${C_WHITE}usage${C_OFF} : $SCRIPT_NAME [OPTIONS] [-c CONF_FILE_PATH] [-DR] FILES or DIRS...
     --silent      : 標準出力を行いません. syslog出力は行います.ttyがない場合は自動的にsilentオプションが指定されます.
     --no-color    :
     --verbose     :
@@ -194,9 +194,13 @@ ${C_WHITE}usage${C_OFF} : $SCRIPT_NAME [OPTIONS] [-c CONF_FILE_PATH] [-D] [-r RE
     -c CONF_FILE_PATH
       コンフィグレーションファイルのパスを指定します.
 
-    -r REDUCE_DIR
-      指定されたディレクトリ配下のバックアップファイルのうち、重複しているファイルを
+    -R
+      引数で指定されたディレクトリ配下のバックアップファイルのうち、重複しているファイルを
       シンボリックリンクで置き換え、バックアップ要領を削減します.
+    
+    FILES or DIRS
+      バックアップ時: バックアップリストファイル(複数可)
+      -R 指定時:      削減対象ディレクトリ(複数可)
 
   ${C_WHITE}flexi-backup.conf${C_OFF} :
     BACKUP_BASE (mandatory)
@@ -927,12 +931,12 @@ shift $ARG_CNT
 [[ "$_HELP" ]] && _usage
 [[ "$_ESTIMATE" ]] && _DRY_RUN=yes
 
-while getopts c:r:Dh OPT; do
+_SUBCMD=backup
+while getopts c:RDh OPT; do
   case "$OPT" in
     c) readonly _CONF_FILE_PATH=$OPTARG
       ;;
-    r) readonly _SUBCMD=replace-symlimk
-       readonly _REPLACE_TARGET="$OPTARG"
+    R) _SUBCMD=reduce-deplicated
       ;;
     D) readonly _DRY_RUN=yes
       ;;
@@ -947,25 +951,33 @@ _setup_out
 
 #- Main process ----------------------------------------------------------------
 
-if [[ $_SUBCMD = 'replace-symlimk' ]]; then
-  [[ ! -d "$_REPLACE_TARGET" ]] && __error_end "Directory not found. : $_REPLACE_TARGET"
-  REPLACE_TARGET=`readlink -f $_REPLACE_TARGET`
-  echo "${C_CYAN}Reducing ${REPLACE_TARGET} ...${C_OFF}"
-  _make_hash "$REPLACE_TARGET"
-  _replace_symbolic_link "$REPLACE_TARGET"
-  echo "$? file(s) reduced."
-else
-  echo "${C_CYAN}process start.${C_OFF}"
+case "$_SUBCMD" in
+  backup)
+    echo "${C_CYAN}process start.${C_OFF}"
 
-  _detect_compress_progs
-  _load_conf
+    _detect_compress_progs
+    _load_conf
 
-  [[ $# -eq 0 ]] && _usage "backup list files are not specified."
-  for LIST_FILE in "$@"; do
-    while read LINE; do
-      _deal_backup_item "$LINE"
-    done < <(_read_backuplist "$LIST_FILE")
-  done
-fi
+    [[ $# -eq 0 ]] && _usage "backup list files are not specified."
+    for LIST_FILE in "$@"; do
+      while read LINE; do
+        _deal_backup_item "$LINE"
+      done < <(_read_backuplist "$LIST_FILE")
+    done
+    ;;
+
+  reduce-deplicated)
+    [[ $# -eq 0 ]] && _usage "Target directories are not specified."
+    for TARGET_DIR in "$@"; do
+      [[ ! -d "$TARGET_DIR" ]] && __error_end "Directory not found. : $TARGET_DIR"
+      TARGET_DIR=`readlink -f $TARGET_DIR`
+
+      echo "${C_CYAN}Reducing ${TARGET_DIR} ...${C_OFF}"
+      _make_hash "$TARGET_DIR"
+      _replace_symbolic_link "$TARGET_DIR"
+      echo "$? file(s) reduced."
+    done
+    ;;
+esac
 
 # vim: ts=2 sw=2 sts=2 et nu foldmethod=marker
