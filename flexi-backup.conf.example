@@ -9,3 +9,5 @@ IDENTITY_FILE=~/.ssh/id_rsa
 
 TMP_DIR=/tmp
 
+REDUCTION=yes
+

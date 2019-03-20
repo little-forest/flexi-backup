@@ -29,6 +29,7 @@ _BACKUP_TMP_DIR=
 _GENERATION=
 _ARCHIVE_SUFFIX='+_%Y%m%d-%H%M%S'
 _ROTATE_TARGET_PATTERN='.+_[0-9]+-[0-9]+\.tar(\.[a-zA-Z0-9]+)?$'
+_REDUCTION=
 
 _REMOTE_PROTO=
 _REMOTE_HOST=
@@ -298,7 +299,7 @@ _load_conf() { #{{{
   readonly _BACKUP_BASE
 
   # verify rotate generation
-  if [[ "$GENERATION" ]]; then
+  if [[ -v GENERATION ]]; then
     [[ "$GENERATION" =~ [0-9]+ ]] || __error_end "Illegal generation. : $GENERATION"
     [[ "$GENERATION" -ge 0 ]] || __error_end "Illegal generation. : $GENERATION"
     _GENERATION=`expr $GENERATION + 0`
@@ -306,6 +307,13 @@ _load_conf() { #{{{
   echo "Backup generation : $_GENERATION" >&5
   readonly _GENERATION
 
+  # verify reduction
+  if [[ -v REDUCTION ]]; then
+    [[ "$REDUCTION" =~ (yes|no) ]] || __error_end "Illegal argument. REDUCTION=$REDUCTION"
+    readonly _REDUCTION="$REDUCTION"
+  else
+    readonly _REDUCTION=no
+  fi
 }
 #}}}
 
@@ -606,6 +614,9 @@ _backup() { #{{{
 
   if [[ $_DRY_RUN ]]; then
     _list_target "${TARGET_DIR}" "${BACKUP_DST_PATH}"
+    if [[ $_REDUCTION == 'yes' ]]; then
+      _reduce "`dirname ${BACKUP_DST_PATH}`"
+    fi
     return 0
   fi
 
@@ -648,6 +659,12 @@ _backup() { #{{{
         echo "Moving file failed. : ${TMP_FILE}" >&2
       fi
     fi
+  fi
+
+  #-----------------------------------
+  # reduce
+  if [[ $_REDUCTION == 'yes' ]]; then
+    _reduce "`dirname ${BACKUP_DST_PATH}`"
   fi
 }
 #}}}
@@ -924,6 +941,15 @@ _replace_symbolic_link() { #{{{
 }
 #}}}
 
+_reduce() { #{{{
+  local TARGET_DIR="$1"
+  echo "${C_CYAN}Reducing ${TARGET_DIR} ...${C_OFF}"
+  _make_hash "$TARGET_DIR"
+  _replace_symbolic_link "$TARGET_DIR"
+  echo "$? file(s) reduced."
+}
+#}}}
+
 #-------------------------------------------------------------------------------
 #- Main process ----------------------------------------------------------------
 #-------------------------------------------------------------------------------
@@ -990,11 +1016,7 @@ case "$_SUBCMD" in
     for TARGET_DIR in "$@"; do
       [[ ! -d "$TARGET_DIR" ]] && __error_end "Directory not found. : $TARGET_DIR"
       TARGET_DIR=`readlink -f $TARGET_DIR`
-
-      echo "${C_CYAN}Reducing ${TARGET_DIR} ...${C_OFF}"
-      _make_hash "$TARGET_DIR"
-      _replace_symbolic_link "$TARGET_DIR"
-      echo "$? file(s) reduced."
+      _reduce "$TARGET_DIR"
     done
     ;;
 
