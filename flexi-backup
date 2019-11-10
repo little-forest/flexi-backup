@@ -113,6 +113,7 @@ __setup_color() { #{{{
   readonly C_B_MAGENTA=`tput setab 5`
   readonly C_B_CYAN=`tput setab 6`
   readonly C_B_WHITE=`tput setab 7`
+  readonly C_B_GRAY=`tput setab 102`
 
   # Foreground
   readonly C_BLACK=`tput setaf 0`
@@ -123,6 +124,7 @@ __setup_color() { #{{{
   readonly C_MAGENTA=`tput setaf 5`
   readonly C_CYAN=`tput setaf 6`
   readonly C_WHITE="${C_BOLD}`tput setaf 7`"
+  readonly C_GRAY=`tput setaf 102`
 
   readonly __COLORED=yes
 }
@@ -182,7 +184,7 @@ _usage() { #{{{
   local LONG_OPTIONS=`$SED 's/([a-zA-Z0-9-]+)/[\1]/g' <<<"${_LONG_OPT_NAMES[@]}"`
 
   cat <<EOM
-${C_WHITE}usage${C_OFF} : $SCRIPT_NAME [OPTIONS] [-c CONF_FILE_PATH] [-DR] [-r GENERATION] FILES or DIRS...
+${C_WHITE}usage${C_OFF} : $SCRIPT_NAME [OPTIONS] [-c CONF_FILE_PATH] [-DRlL] [-r GENERATION] FILES or DIRS...
     --silent      : 標準出力を行いません. syslog出力は行います.ttyがない場合は自動的にsilentオプションが指定されます.
     --no-color    :
     --verbose     :
@@ -198,6 +200,13 @@ ${C_WHITE}usage${C_OFF} : $SCRIPT_NAME [OPTIONS] [-c CONF_FILE_PATH] [-DR] [-r G
     -R
       引数で指定されたディレクトリ配下のバックアップファイルのうち、重複しているファイルを
       シンボリックリンクで置き換え、バックアップ要領を削減します.
+
+    -l
+      バックアップファイルの状況を表示します.
+    
+    -L
+      バックアップファイルの状況を詳しく表示します.
+      重複してシンボリックリンクで置き換えられたファイルも含めて表示されます.
 
     -r GENERATION
       指定されたディレクトリ配下のバックアップをローテートします.
@@ -318,6 +327,8 @@ _load_conf() { #{{{
 #}}}
 
 _check_dir_writable() { #{{{
+  [[ $_LIST_BACKUPS = yes ]] && return
+
   local TARGET_DIR="$1"
 
   local TMPFILE="${TARGET_DIR}/`basename $(mktemp -u)`"
@@ -568,6 +579,12 @@ _deal_backup_item() { #{{{
   
   _LOCAL_GENERATION=
   _parse_opts $OPTS
+
+  # list backups
+  if [[ $_LIST_BACKUPS == yes ]]; then
+    _list_backups "$_TARGET_DIR"
+    return 0
+  fi
 
   # do backup
   [[ ! "$_ROTATE" && ! "$ROTATE_ONLY" ]] && _backup "$_TARGET_DIR" "$ARC_TYPE"
@@ -950,6 +967,57 @@ _reduce() { #{{{
 }
 #}}}
 
+_list_backups() { #{{{
+  local TARGET_DIR="$1"
+  local BACKUP_DST_DIR=`_get_archive_base "$TARGET_DIR"`
+
+  echo -en "${C_CYAN}${TARGET_DIR}${C_OFF} ==> ${C_GREEN}${BACKUP_DST_DIR}${C_OFF}"
+  local SIZE=`du -sh "$BACKUP_DST_DIR" | awk '{print $1}'`
+  echo "  (`_get_size ${BACKUP_DST_DIR}`)"
+
+  local ARC_FILE BASE_NAME C_SRC
+  while read ARC_FILE; do
+    BASE_NAME=`basename "$ARC_FILE"`
+
+    # check if symbolic link
+    if [[ -L "$ARC_FILE" ]]; then
+      # symbolic link
+      if [[ $_LIST_BACKUPS_DETAIL = yes ]]; then
+        local SRC_PATH=`readlink -f "${ARC_FILE}"`
+        [[ -f "${SRC_PATH}" ]] && C_SRC=${C_BLUE} || C_SRC=${C_RED}
+        SRC_PATH=`basename "${SRC_PATH}"`
+        echo -e "    ${C_BLUE}${BASE_NAME}${C_OFF} -> ${C_SRC}${SRC_PATH}${C_OFF}"
+      fi
+    else
+      # normal file
+      echo -en "    ${BASE_NAME} ${C_GRAY}(`_get_size ${ARC_FILE}`)${C_OFF}"
+
+      # count symblic links
+      local CNT=$(find "$BACKUP_DST_DIR" -type l -regextype posix-egrep -regex '.+\.(tar|gz|bz2|xz)$' \
+        | xargs ls -la \
+        | grep -- " -> ${BACKUP_DST_DIR}/${BASE_NAME}" \
+        | wc -l)
+
+      if [[ $CNT -gt 0 ]]; then
+        echo -en "${C_GRAY}"
+        printf " %2d refs" ${CNT}
+        echo -e "${C_OFF}"
+      else
+        echo
+      fi
+    fi
+
+  done < <(find "$BACKUP_DST_DIR" -regextype posix-egrep -regex '.+\.(tar|gz|bz2|xz)$' | sort)
+
+}
+#}}}
+
+_get_size() { #{{{
+  local TARGET="$1"
+  du -sh "$TARGET" | awk '{print $1}'
+}
+#}}}
+
 #-------------------------------------------------------------------------------
 #- Main process ----------------------------------------------------------------
 #-------------------------------------------------------------------------------
@@ -974,7 +1042,7 @@ shift $ARG_CNT
 [[ "$_ESTIMATE" ]] && _DRY_RUN=yes
 
 _SUBCMD=backup
-while getopts c:Rr:Dh OPT; do
+while getopts c:Rr:lLDh OPT; do
   case "$OPT" in
     c) readonly _CONF_FILE_PATH=$OPTARG
       ;;
@@ -982,6 +1050,10 @@ while getopts c:Rr:Dh OPT; do
       ;;
     r) _SUBCMD=rotate
        _ROTATE_GENERATION=$OPTARG
+      ;;
+    l) readonly _LIST_BACKUPS=yes
+      ;;
+    L) readonly _LIST_BACKUPS=yes; _LIST_BACKUPS_DETAIL=yes
       ;;
     D) readonly _DRY_RUN=yes
       ;;
